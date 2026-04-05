@@ -1,50 +1,96 @@
 #!/bin/bash
 set -euo pipefail
 
-# Keep only the real worker in Hadoop workers/slaves lists.
-WORKERS_FILE="$HADOOP_HOME/etc/hadoop/workers"
-SLAVES_FILE="$HADOOP_HOME/etc/hadoop/slaves"
+cd /app
 
-cat > "$WORKERS_FILE" <<'EOF'
-cluster-slave-1
-EOF
+mkdir -p /var/run/sshd /run/sshd || true
+service ssh start || /etc/init.d/ssh start || true
+/usr/sbin/sshd || true
+sleep 3
 
-if [ -f "$SLAVES_FILE" ]; then
-  cat > "$SLAVES_FILE" <<'EOF'
-cluster-slave-1
-EOF
+echo "Starting Hadoop services..."
+bash start-services.sh
+
+echo "Recreating Python virtual environment..."
+rm -rf .venv
+python3 -m venv .venv
+source .venv/bin/activate
+
+pip install --upgrade pip
+pip install -r requirements.txt
+
+echo "Packing virtual environment for Spark on YARN..."
+rm -f .venv.tar.gz
+venv-pack -o .venv.tar.gz
+
+export CASSANDRA_HOST="${CASSANDRA_HOST:-cassandra-server}"
+
+wait_for_hdfs() {
+  echo "Waiting for HDFS..."
+  for _ in $(seq 1 60); do
+    if hdfs dfs -ls / >/dev/null 2>&1; then
+      echo "HDFS is ready"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "ERROR: HDFS is not ready"
+  return 1
+}
+
+wait_for_cassandra() {
+  echo "Waiting for Cassandra..."
+  for _ in $(seq 1 90); do
+    if python3 - <<'PY'
+import os
+from cassandra.cluster import Cluster
+
+host = os.environ.get("CASSANDRA_HOST", "cassandra-server")
+try:
+    cluster = Cluster([host])
+    session = cluster.connect()
+    session.execute("SELECT release_version FROM system.local")
+    cluster.shutdown()
+    raise SystemExit(0)
+except Exception:
+    raise SystemExit(1)
+PY
+    then
+      echo "Cassandra is ready"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "ERROR: Cassandra is not ready"
+  return 1
+}
+
+wait_for_hdfs
+wait_for_cassandra
+
+TXT_COUNT=$(find data -type f -name "*.txt" | wc -l | tr -d ' ')
+
+if [ "$TXT_COUNT" -eq 0 ] && [ -f /app/a.parquet ]; then
+  echo "No local txt files found, extracting 1000 docs from /app/a.parquet ..."
+  python3 extract_from_parquet.py /app/a.parquet 1000 data
+  TXT_COUNT=$(find data -type f -name "*.txt" | wc -l | tr -d ' ')
 fi
 
-# Start HDFS
-$HADOOP_HOME/sbin/start-dfs.sh
+if [ "$TXT_COUNT" -gt 0 ]; then
+  echo "Found $TXT_COUNT txt documents. Running demo pipeline..."
+  bash prepare_data.sh
+  CASSANDRA_HOST="$CASSANDRA_HOST" bash index.sh
 
-# Start YARN
-$HADOOP_HOME/sbin/start-yarn.sh
+  echo
+  echo "Demo query 1:"
+  CASSANDRA_HOST="$CASSANDRA_HOST" bash search.sh "history time" || true
 
-# Start MapReduce history server
-mapred --daemon start historyserver || true
+  echo
+  echo "Demo query 2:"
+  CASSANDRA_HOST="$CASSANDRA_HOST" bash search.sh "christmas carol" || true
+else
+  echo "No txt documents found in /app/data and no /app/a.parquet provided."
+  echo "Environment is ready for manual run."
+fi
 
-# Wait a bit until HDFS becomes responsive
-for _ in $(seq 1 30); do
-  if hdfs dfs -ls / >/dev/null 2>&1; then
-    break
-  fi
-  sleep 2
-done
-
-# Diagnostics
-jps -lm || true
-hdfs dfsadmin -report || true
-hdfs dfsadmin -safemode leave || true
-
-# Prepare HDFS folders for Spark on YARN
-hdfs dfs -mkdir -p /apps/spark/jars || true
-hdfs dfs -chmod 744 /apps/spark/jars || true
-hdfs dfs -put -f /usr/local/spark/jars/* /apps/spark/jars/ || true
-hdfs dfs -chmod -R 755 /apps/spark/jars || true
-
-# Root home in HDFS
-hdfs dfs -mkdir -p /user/root || true
-
-scala -version || true
-jps -lm || true
+tail -f /dev/null

@@ -51,12 +51,10 @@ def bm25(tf, df, doc_len, avgdl, n_docs, k1=K1, b=B):
 
 
 def read_query():
-    stdin_query = sys.stdin.read().strip()
-    if stdin_query:
-        return stdin_query
-
     argv_query = " ".join(sys.argv[1:]).strip()
-    return argv_query
+    if argv_query:
+        return argv_query
+    return ""
 
 
 def load_collection_stats(session):

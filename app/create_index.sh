@@ -2,92 +2,32 @@
 set -euo pipefail
 
 cd /app
-
-service ssh restart || true
-
-echo "Starting Hadoop services..."
-bash start-services.sh
-
-echo "Recreating Python virtual environment..."
-rm -rf .venv
-python3 -m venv .venv
 source .venv/bin/activate
 
-pip install --upgrade pip
-pip install -r requirements.txt
+INPUT_PATH="${1:-/input/data}"
 
-echo "Packing virtual environment for Spark on YARN..."
-rm -f .venv.tar.gz
-venv-pack -o .venv.tar.gz
+echo "Creating index from HDFS input: $INPUT_PATH"
 
-export CASSANDRA_HOST="${CASSANDRA_HOST:-cassandra-server}"
+hdfs dfs -test -e "$INPUT_PATH"
 
-wait_for_hdfs() {
-  echo "Waiting for HDFS..."
-  for _ in $(seq 1 60); do
-    if hdfs dfs -ls / >/dev/null 2>&1; then
-      echo "HDFS is ready"
-      return 0
-    fi
-    sleep 2
-  done
-  echo "ERROR: HDFS is not ready"
-  return 1
-}
+echo "Cleaning old index folders..."
+hdfs dfs -rm -r -f /indexer || true
+hdfs dfs -rm -r -f /tmp/indexer || true
 
-wait_for_cassandra() {
-  echo "Waiting for Cassandra..."
-  for _ in $(seq 1 90); do
-    if python3 - <<'PY'
-import os
-from cassandra.cluster import Cluster
+hdfs dfs -mkdir -p /indexer
 
-host = os.environ.get("CASSANDRA_HOST", "cassandra-server")
-try:
-    cluster = Cluster([host])
-    session = cluster.connect()
-    session.execute("SELECT release_version FROM system.local")
-    cluster.shutdown()
-    raise SystemExit(0)
-except Exception:
-    raise SystemExit(1)
-PY
-    then
-      echo "Cassandra is ready"
-      return 0
-    fi
-    sleep 2
-  done
-  echo "ERROR: Cassandra is not ready"
-  return 1
-}
+echo "Running Hadoop Streaming job..."
+hadoop jar "$HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming"*.jar \
+  -D mapreduce.job.name="search-engine-index" \
+  -D mapreduce.job.reduces=1 \
+  -files /app/mapreduce/mapper1.py,/app/mapreduce/reducer1.py \
+  -mapper "python3 mapper1.py" \
+  -reducer "python3 reducer1.py" \
+  -input "$INPUT_PATH" \
+  -output /indexer/index
 
-wait_for_hdfs
-wait_for_cassandra
+echo "Checking index output..."
+hdfs dfs -ls /indexer/index
+hdfs dfs -cat /indexer/index/part-00000 | head -5 || true
 
-TXT_COUNT=$(find data -type f -name "*.txt" | wc -l | tr -d ' ')
-
-if [ "$TXT_COUNT" -eq 0 ] && [ -f /app/a.parquet ]; then
-  echo "No local txt files found, extracting 1000 docs from /app/a.parquet ..."
-  python3 extract_from_parquet.py /app/a.parquet 1000 data
-  TXT_COUNT=$(find data -type f -name "*.txt" | wc -l | tr -d ' ')
-fi
-
-if [ "$TXT_COUNT" -gt 0 ]; then
-  echo "Found $TXT_COUNT txt documents. Running demo pipeline..."
-  bash prepare_data.sh
-  CASSANDRA_HOST="$CASSANDRA_HOST" bash index.sh
-
-  echo
-  echo "Demo query 1:"
-  CASSANDRA_HOST="$CASSANDRA_HOST" bash search.sh "history time" || true
-
-  echo
-  echo "Demo query 2:"
-  CASSANDRA_HOST="$CASSANDRA_HOST" bash search.sh "christmas carol" || true
-else
-  echo "No txt documents found in /app/data and no /app/a.parquet provided."
-  echo "Environment is ready for manual run."
-fi
-
-tail -f /dev/null
+echo "create_index.sh done"
