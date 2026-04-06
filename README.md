@@ -1,4 +1,3 @@
-````markdown
 # big-data-assignment2
 
 Simple search engine using Hadoop MapReduce, Cassandra, and Spark RDD.
@@ -118,5 +117,4 @@ Main required files are in `app/`:
 * `extract_from_parquet.py`
 * `requirements.txt`
 
-```
 ```
